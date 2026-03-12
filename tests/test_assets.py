@@ -51,7 +51,7 @@ def test_upload_asset():
         params={"is_public": True}
     )
     
-    assert response.status_code == 200
+    assert response.status_code == 201
     data = response.json()
     assert data["filename"] == "test.txt"
     assert data["mime_type"] == "text/plain"
