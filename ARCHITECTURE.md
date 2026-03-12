@@ -1,5 +1,280 @@
 # Architecture
 
+## System Overview
+
+The High-Performance Content Delivery API is designed to minimize latency and maximize cache hit rates through strategic use of HTTP caching, CDN integration, and object storage.
+
+### Architecture Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                                  CLIENTS                                     │
+│  (Web Browsers, Mobile Apps, API Consumers)                                 │
+└────────────────────────────────────────┬────────────────────────────────────┘
+                                         │
+                    ┌────────────────────┴────────────────────┐
+                    │                                         │
+            (HTTPS/HTTP)                            (HTTPS/HTTP)
+                    │                                         │
+        ┌───────────▼────────────┐              ┌──────────────▼─────────┐
+        │  CDN Edge Servers      │              │  Origin API Server     │
+        │  (Cloudflare, etc.)    │              │  (FastAPI)             │
+        │                        │              │                        │
+        │ - Cache Layer 1        │◄─────────────┤ - Request Routing      │
+        │ - Origin Shield        │              │ - Request Handling     │
+        │ - DDoS Protection      │              │ - ETag Generation      │
+        │ - Compression          │              │ - Token Validation     │
+        └────────────┬───────────┘              └──────────┬─────────────┘
+                     │                                     │
+                     └─────────────────┬───────────────────┘
+                                       │
+                    ┌──────────────────┼──────────────────┐
+                    │                  │                  │
+                    ▼                  ▼                  ▼
+        ┌─────────────────────┐ ┌─────────────────┐ ┌──────────────────┐
+        │   PostgreSQL DB     │ │  Redis Cache    │ │ Object Storage   │
+        │                     │ │  (Optional)     │ │ (MinIO/S3)       │
+        │ - Asset Metadata    │ │                 │ │                  │
+        │ - Versions          │ │ - Future Add-on │ │ - Asset Files    │
+        │ - Access Tokens     │ │ - Not enabled   │ │ - Versioned Objs │
+        └─────────────────────┘ └─────────────────┘ └──────────────────┘
+```
+
+## Request Flow
+
+### 1. Public Asset Download (Cached)
+
+```
+Client Request (GET /assets/{id}/download)
+    │
+    ├─► CDN Edge Server
+    │   ├─ Cache HIT (304 or 200 with cached content)
+    │   └─ Return response (0-10ms)
+    │
+    └─► (If cache MISS)
+        └─► Origin API Server
+            ├─ Query PostgreSQL for asset metadata
+            ├─ Generate/retrieve ETag
+            ├─ Check If-None-Match header
+            ├─ Download from S3 if needed
+            ├─ Set Cache-Control: public, s-maxage=3600, max-age=60
+            ├─ Return 200 OK with content
+            └─ CDN caches response for 1 hour (edge), browser for 60s
+```
+
+**Response Headers:**
+```
+HTTP/1.1 200 OK
+ETag: "a1b2c3d4e5f6..."
+Last-Modified: Wed, 10 Jan 2024 10:00:00 GMT
+Cache-Control: public, s-maxage=3600, max-age=60
+Content-Type: application/pdf
+Content-Length: 1024000
+X-Content-Type-Options: nosniff
+```
+
+### 2. Conditional Request (304 Not Modified)
+
+```
+Client Request (GET with If-None-Match: "etag")
+    │
+    ├─► CDN Edge Server
+    │   └─ Cache HIT (return 304 with empty body)
+    │       OR pass through to origin
+    │
+    └─► Origin API Server
+        ├─ Query PostgreSQL for asset
+        ├─ Compare ETag (no hash calculation!)
+        ├─ Match found
+        ├─ Return 304 Not Modified (0 bytes)
+        └─ Saves bandwidth
+```
+
+**Benefits:**
+- Zero bytes transmitted
+- Reduces bandwidth by 99%+
+- Client uses cached version
+- Very low latency response time at the edge
+
+### 3. Private Asset Access (Token-Based)
+
+```
+Client Request (GET /assets/private/{token})
+    │
+    ├─► CDN (NOT cached)
+    │   └─ Pass through to origin
+    │
+    └─► Origin API Server
+        ├─ Query PostgreSQL for access token
+        ├─ Validate token
+        │  ├─ Check if token exists
+        │  ├─ Check if not revoked
+        │  ├─ Check if not expired
+        │
+        ├─ If valid
+        │  ├─ Query asset metadata
+        │  ├─ Set Cache-Control: private, no-store, no-cache, must-revalidate
+        │  ├─ Download from S3
+        │  └─ Return 200 OK
+        │
+        └─ If invalid
+           └─ Return 403 Forbidden
+```
+
+**Response Headers (Private):**
+```
+HTTP/1.1 200 OK
+ETag: "x1y2z3a4b5c6..."
+Cache-Control: private, no-store, no-cache, must-revalidate
+Content-Type: application/pdf
+X-Content-Type-Options: nosniff
+```
+
+### 4. Asset Upload Flow
+
+```
+Client Request (POST /assets/upload)
+    │
+    └─► Origin API Server
+        ├─ Receive file upload
+        ├─ Calculate SHA-256 ETag of content
+        ├─ Upload to MinIO/S3
+        ├─ Store metadata in PostgreSQL
+        │  ├─ Asset ID (UUID)
+        │  ├─ Filename
+        │  ├─ MIME type
+        │  ├─ File size
+        │  ├─ ETag (strong)
+        │  ├─ Object storage key
+        │  └─ Timestamps
+        │
+        └─ Return 201 Created with metadata
+            {
+              "id": "asset-uuid",
+              "filename": "file.pdf",
+              "etag": "\"sha256hash\"",
+              "size": 1024000,
+              "is_public": true,
+              "created_at": "2024-01-10T10:00:00"
+            }
+```
+
+### 5. Asset Publishing (Versioning)
+
+```
+Client Request (POST /assets/{id}/publish)
+    │
+    └─► Origin API Server
+        ├─ Query current asset
+        ├─ Download current content from S3
+        ├─ Create version object key: versions/{id}/v{n}/filename
+        ├─ Upload to S3 (immutable)
+        ├─ Store AssetVersion in PostgreSQL
+        │  ├─ Version number
+        │  ├─ Object key
+        │  ├─ ETag
+        │  └─ Timestamp
+        │
+        ├─ Increment asset version counter
+        ├─ Trigger CDN purge (if enabled)
+        │
+        └─ Return 200 OK
+            {
+              "version_id": "version-uuid",
+              "version_number": 1,
+              "etag": "\"sha256hash\"",
+              "url": "https://cdn.example.com/assets/public/version-uuid"
+            }
+```
+
+## Caching Strategy
+
+### Three-Tier Cache Architecture
+
+```
+┌─────────────────────────────────────────────┐
+│  Tier 1: Browser Cache (Client-side)        │
+│  - max-age: 60 seconds                      │
+│  - Revalidates after 60s                    │
+│  - Respects ETag                            │
+│  - Saves bandwidth                          │
+└─────────────────────────────────────────────┘
+                     │
+┌─────────────────────▼─────────────────────────┐
+│  Tier 2: CDN Edge Cache (Cloudflare, etc)    │
+│  - max-age (public): 31536000 (1 year)       │
+│  - max-age (mutable): 3600 (1 hour)          │
+│  - Origin shield: Additional layer            │
+│  - Immutable flag for versioned content      │
+│  - Cache hit ratio target: >95%              │
+└─────────────────────────────────────────────┘
+                     │
+┌─────────────────────▼─────────────────────────┐
+│  Tier 3: Origin Server Cache (Optional)      │
+│  - Query result cache                        │
+│  - Asset metadata cache                      │
+│  - ETag lookup cache                         │
+└─────────────────────────────────────────────┘
+```
+
+### Cache Directives
+
+#### Immutable Content (Versioned)
+```
+Cache-Control: public, max-age=31536000, immutable
+```
+- Cached for 1 year (31536000 seconds)
+- Never expires
+- Immutable flag prevents revalidation
+- Safe for versioned URLs
+
+#### Mutable Content (Latest)
+```
+Cache-Control: public, s-maxage=3600, max-age=60
+```
+- Browser: 60 seconds (max-age)
+- CDN: 3600 seconds (s-maxage)
+- After browser cache expires, revalidates
+- CDN holds longer for efficiency
+
+#### Private Content
+```
+Cache-Control: private, no-store, no-cache, must-revalidate
+```
+- Not cached by CDN
+- Not stored in browser cache
+- Always revalidates
+- Required for sensitive content
+
+## ETag Strategy
+
+### Strong ETag Generation
+
+```python
+import hashlib
+
+def generate_etag(content: bytes) -> str:
+    """Generate strong ETag using SHA-256"""
+    hash_value = hashlib.sha256(content).hexdigest()
+    return f'"{hash_value}"'
+```
+
+**Advantages:**
+- SHA-256 provides collision resistance
+- Changes for any byte modification
+- Stored in DB (no recalculation)
+- Used for 304 Not Modified responses
+
+### ETag-Based Conditional Requests
+
+```
+Client: GET /assets/123
+Server Response:
+  HTTP/1.1 200 OK
+  ETag: "a1b2c3d4e5f6..."
+  
+Client (later):
+  GET /assets/123
   If-None-Match: "a1b2c3d4e5f6..."
   
 Server (matching ETag):
@@ -117,7 +392,7 @@ PostgreSQL:
 
 ### 4. Object Storage
 - Async uploads to S3/MinIO
-- Streaming downloads
+- Buffered downloads (current implementation)
 - Signed URLs for direct access
 
 ## Monitoring & Observability
