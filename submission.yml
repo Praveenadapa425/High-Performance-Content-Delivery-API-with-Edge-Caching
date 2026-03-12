@@ -1,7 +1,12 @@
+# High-Performance Content Delivery API - Submission Configuration
+# This file defines the commands for setup, testing, and benchmarking
+
 setup:
   - command: "pip install -r requirements.txt"
   - command: "docker-compose build"
+
 test:
-  - command: "pytest -q"
+  - command: "docker-compose run --rm api pytest tests/ -v --tb=short"
+
 benchmark:
-  - command: "python scripts/run_benchmark.py"
+  - command: "docker-compose run --rm api python scripts/benchmark.py"
