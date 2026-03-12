@@ -1,4 +1,4 @@
-from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, Response, Header
+from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, Response, Header, status
 from sqlalchemy.orm import Session
 import uuid
 from app.database import get_db
@@ -14,7 +14,7 @@ from datetime import datetime
 router = APIRouter(prefix="/assets", tags=["assets"])
 
 
-@router.post("/upload")
+@router.post("/upload", status_code=status.HTTP_201_CREATED)
 async def upload_asset(
     file: UploadFile = File(...),
     is_public: bool = False,
