@@ -6,60 +6,46 @@ The High-Performance Content Delivery API is designed to minimize latency and ma
 
 ### Architecture Diagram
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                                  CLIENTS                                     │
-│  (Web Browsers, Mobile Apps, API Consumers)                                 │
-└────────────────────────────────────────┬────────────────────────────────────┘
-                                         │
-                    ┌────────────────────┴────────────────────┐
-                    │                                         │
-            (HTTPS/HTTP)                            (HTTPS/HTTP)
-                    │                                         │
-        ┌───────────▼────────────┐              ┌──────────────▼─────────┐
-        │  CDN Edge Servers      │              │  Origin API Server     │
-        │  (Cloudflare, etc.)    │              │  (FastAPI)             │
-        │                        │              │                        │
-        │ - Cache Layer 1        │◄─────────────┤ - Request Routing      │
-        │ - Origin Shield        │              │ - Request Handling     │
-        │ - DDoS Protection      │              │ - ETag Generation      │
-        │ - Compression          │              │ - Token Validation     │
-        └────────────┬───────────┘              └──────────┬─────────────┘
-                     │                                     │
-                     └─────────────────┬───────────────────┘
-                                       │
-                    ┌──────────────────┼──────────────────┐
-                    │                  │                  │
-                    ▼                  ▼                  ▼
-        ┌─────────────────────┐ ┌─────────────────┐ ┌──────────────────┐
-        │   PostgreSQL DB     │ │  Redis Cache    │ │ Object Storage   │
-        │                     │ │  (Optional)     │ │ (MinIO/S3)       │
-        │ - Asset Metadata    │ │                 │ │                  │
-        │ - Versions          │ │ - Future Add-on │ │ - Asset Files    │
-        │ - Access Tokens     │ │ - Not enabled   │ │ - Versioned Objs │
-        └─────────────────────┘ └─────────────────┘ └──────────────────┘
+```mermaid
+graph TB
+    C["CLIENTS (Web Browsers, Mobile Apps, API Consumers)"]
+
+    subgraph CDNLayer["CDN Edge Servers (Cloudflare, etc.)"]
+        CE["Cache Layer 1 · Origin Shield · DDoS Protection · Compression"]
+    end
+
+    subgraph OriginLayer["Origin API Server (FastAPI)"]
+        API["Request Routing · ETag Generation · Token Validation"]
+    end
+
+    DB[("PostgreSQL DB — Asset Metadata · Versions · Access Tokens")]
+    Redis[("Redis Cache — Future Add-on · Not Enabled")]
+    S3[("Object Storage — MinIO / S3 — Asset Files · Versioned Objects")]
+
+    C -->|HTTPS/HTTP| CDNLayer
+    C -->|HTTPS/HTTP| OriginLayer
+    CDNLayer <-->|Origin Pull| OriginLayer
+    OriginLayer --> DB
+    OriginLayer -.->|not enabled| Redis
+    OriginLayer --> S3
 ```
 
 ## Request Flow
 
 ### 1. Public Asset Download (Cached)
 
-```
-Client Request (GET /assets/{id}/download)
-    │
-    ├─► CDN Edge Server
-    │   ├─ Cache HIT (304 or 200 with cached content)
-    │   └─ Return response (0-10ms)
-    │
-    └─► (If cache MISS)
-        └─► Origin API Server
-            ├─ Query PostgreSQL for asset metadata
-            ├─ Generate/retrieve ETag
-            ├─ Check If-None-Match header
-            ├─ Download from S3 if needed
-            ├─ Set Cache-Control: public, s-maxage=3600, max-age=60
-            ├─ Return 200 OK with content
-            └─ CDN caches response for 1 hour (edge), browser for 60s
+```mermaid
+flowchart TD
+    A["Client: GET /assets/asset_id/download"] --> B{"CDN Edge"}
+    B -->|"Cache HIT"| C["Return cached response (0-10ms)"]
+    B -->|"Cache MISS"| D["Origin API Server"]
+    D --> E["Query PostgreSQL for asset metadata"]
+    E --> F{"If-None-Match header?"}
+    F -->|"ETag matches"| G["Return 304 Not Modified — 0 bytes"]
+    F -->|"No match"| H["Download from MinIO/S3"]
+    H --> I["Set Cache-Control: public, s-maxage=3600, max-age=60"]
+    I --> J["Return 200 OK + ETag + Last-Modified headers"]
+    J --> K["CDN caches 1hr (edge) / 60s (browser)"]
 ```
 
 **Response Headers:**
@@ -75,19 +61,16 @@ X-Content-Type-Options: nosniff
 
 ### 2. Conditional Request (304 Not Modified)
 
-```
-Client Request (GET with If-None-Match: "etag")
-    │
-    ├─► CDN Edge Server
-    │   └─ Cache HIT (return 304 with empty body)
-    │       OR pass through to origin
-    │
-    └─► Origin API Server
-        ├─ Query PostgreSQL for asset
-        ├─ Compare ETag (no hash calculation!)
-        ├─ Match found
-        ├─ Return 304 Not Modified (0 bytes)
-        └─ Saves bandwidth
+```mermaid
+flowchart TD
+    A["Client: GET with If-None-Match: etag-value"] --> B{"CDN Edge"}
+    B -->|"Cache HIT"| C["Return 304 Not Modified — empty body"]
+    B -->|"Cache MISS"| D["Origin API Server"]
+    D --> E["Query PostgreSQL for asset"]
+    E --> F{"ETag match?"}
+    F -->|"Match"| G["Return 304 Not Modified — 0 bytes — 99%+ bandwidth saved"]
+    F -->|"No match"| H["Return 200 OK with full content"]
+    G --> I["Client uses cached version"]
 ```
 
 **Benefits:**
@@ -98,27 +81,16 @@ Client Request (GET with If-None-Match: "etag")
 
 ### 3. Private Asset Access (Token-Based)
 
-```
-Client Request (GET /assets/private/{token})
-    │
-    ├─► CDN (NOT cached)
-    │   └─ Pass through to origin
-    │
-    └─► Origin API Server
-        ├─ Query PostgreSQL for access token
-        ├─ Validate token
-        │  ├─ Check if token exists
-        │  ├─ Check if not revoked
-        │  ├─ Check if not expired
-        │
-        ├─ If valid
-        │  ├─ Query asset metadata
-        │  ├─ Set Cache-Control: private, no-store, no-cache, must-revalidate
-        │  ├─ Download from S3
-        │  └─ Return 200 OK
-        │
-        └─ If invalid
-           └─ Return 403 Forbidden
+```mermaid
+flowchart TD
+    A["Client: GET /assets/private/token"] --> B["CDN: Not cached — pass through to origin"]
+    B --> C["Origin API Server"]
+    C --> D["Query AccessToken from PostgreSQL"]
+    D --> E{"Token valid?"}
+    E -->|"exists + not revoked + not expired"| F["Query asset metadata"]
+    F --> G["Download content from MinIO/S3"]
+    G --> H["Return 200 OK — Cache-Control: private, no-store"]
+    E -->|"Invalid or expired"| I["Return 403 Forbidden"]
 ```
 
 **Response Headers (Private):**
@@ -132,89 +104,54 @@ X-Content-Type-Options: nosniff
 
 ### 4. Asset Upload Flow
 
-```
-Client Request (POST /assets/upload)
-    │
-    └─► Origin API Server
-        ├─ Receive file upload
-        ├─ Calculate SHA-256 ETag of content
-        ├─ Upload to MinIO/S3
-        ├─ Store metadata in PostgreSQL
-        │  ├─ Asset ID (UUID)
-        │  ├─ Filename
-        │  ├─ MIME type
-        │  ├─ File size
-        │  ├─ ETag (strong)
-        │  ├─ Object storage key
-        │  └─ Timestamps
-        │
-        └─ Return 201 Created with metadata
-            {
-              "id": "asset-uuid",
-              "filename": "file.pdf",
-              "etag": "\"sha256hash\"",
-              "size": 1024000,
-              "is_public": true,
-              "created_at": "2024-01-10T10:00:00"
-            }
+```mermaid
+flowchart TD
+    A["Client: POST /assets/upload"] --> B["Origin API Server"]
+    B --> C["Receive file bytes"]
+    C --> D["Calculate SHA-256 ETag from content"]
+    D --> E["Upload to MinIO/S3"]
+    E --> F["Store metadata in PostgreSQL"]
+    F --> G["Asset ID, Filename, MIME type, File size, ETag, Object key, Timestamps"]
+    G --> H["Return 201 Created with full asset metadata"]
 ```
 
 ### 5. Asset Publishing (Versioning)
 
-```
-Client Request (POST /assets/{id}/publish)
-    │
-    └─► Origin API Server
-        ├─ Query current asset
-        ├─ Download current content from S3
-        ├─ Create version object key: versions/{id}/v{n}/filename
-        ├─ Upload to S3 (immutable)
-        ├─ Store AssetVersion in PostgreSQL
-        │  ├─ Version number
-        │  ├─ Object key
-        │  ├─ ETag
-        │  └─ Timestamp
-        │
-        ├─ Increment asset version counter
-        ├─ Trigger CDN purge (if enabled)
-        │
-        └─ Return 200 OK
-            {
-              "version_id": "version-uuid",
-              "version_number": 1,
-              "etag": "\"sha256hash\"",
-              "url": "https://cdn.example.com/assets/public/version-uuid"
-            }
+```mermaid
+flowchart TD
+    A["Client: POST /assets/asset_id/publish"] --> B["Origin API Server"]
+    B --> C["Query current asset from PostgreSQL"]
+    C --> D["Download current content from S3"]
+    D --> E["Create versioned key: versions/id/vN/filename"]
+    E --> F["Upload immutable copy to S3"]
+    F --> G["Store AssetVersion in PostgreSQL"]
+    G --> H["Increment asset version counter"]
+    H --> I{"CDN purge enabled?"}
+    I -->|"Yes"| J["Trigger Cloudflare cache purge"]
+    I -->|"No"| K["Return 200 OK with version_id, version_number, etag, url"]
+    J --> K
 ```
 
 ## Caching Strategy
 
 ### Three-Tier Cache Architecture
 
-```
-┌─────────────────────────────────────────────┐
-│  Tier 1: Browser Cache (Client-side)        │
-│  - max-age: 60 seconds                      │
-│  - Revalidates after 60s                    │
-│  - Respects ETag                            │
-│  - Saves bandwidth                          │
-└─────────────────────────────────────────────┘
-                     │
-┌─────────────────────▼─────────────────────────┐
-│  Tier 2: CDN Edge Cache (Cloudflare, etc)    │
-│  - max-age (public): 31536000 (1 year)       │
-│  - max-age (mutable): 3600 (1 hour)          │
-│  - Origin shield: Additional layer            │
-│  - Immutable flag for versioned content      │
-│  - Cache hit ratio target: >95%              │
-└─────────────────────────────────────────────┘
-                     │
-┌─────────────────────▼─────────────────────────┐
-│  Tier 3: Origin Server Cache (Optional)      │
-│  - Query result cache                        │
-│  - Asset metadata cache                      │
-│  - ETag lookup cache                         │
-└─────────────────────────────────────────────┘
+```mermaid
+graph TB
+    subgraph T1["Tier 1 — Browser Cache (Client-side)"]
+        B1["max-age: 60s · Revalidates with ETag after 60s · Saves bandwidth on repeat visits"]
+    end
+
+    subgraph T2["Tier 2 — CDN Edge Cache (Cloudflare)"]
+        B2["Mutable content: s-maxage=3600 (1hr) · Versioned immutable: max-age=31536000 (1yr) · Origin shield · Cache hit target >95%"]
+    end
+
+    subgraph T3["Tier 3 — Origin Server (Metadata Lookup)"]
+        B3["Pre-computed SHA-256 ETags in PostgreSQL · No hash recalculation per request · Fast single-query metadata fetch"]
+    end
+
+    T1 -->|"Cache miss or revalidation"| T2
+    T2 -->|"Cache miss"| T3
 ```
 
 ### Cache Directives
@@ -288,89 +225,69 @@ Client: Uses cached version
 
 ### Access Token System
 
-```
-1. Create Token:
-   POST /assets/{id}/access-token
-   ├─ Generate 32-byte random token
-   ├─ Set expiry: now + TOKEN_EXPIRY_SECONDS
-   ├─ Store in PostgreSQL
-   └─ Return to client
+```mermaid
+flowchart TD
+    subgraph Create["1 — Create Token"]
+        CT1["POST /assets/asset_id/access-token"]
+        CT2["Generate secrets.token_urlsafe(32)"]
+        CT3["Set expiry: now + TOKEN_EXPIRY_SECONDS"]
+        CT4["Store in PostgreSQL and return to client"]
+        CT1 --> CT2 --> CT3 --> CT4
+    end
 
-2. Use Token:
-   GET /assets/private/{token}
-   ├─ Query token from DB
-   ├─ Validate:
-   │  ├─ Token exists
-   │  ├─ Not revoked
-   │  ├─ Not expired (datetime.utcnow() < expires_at)
-   └─ If valid: return content
-   └─ If invalid: 403 Forbidden
+    subgraph Use["2 — Use Token"]
+        UT1["GET /assets/private/token"]
+        UT2{"Validate"}
+        UT3["Return 200 OK with asset content"]
+        UT4["Return 403 Forbidden"]
+        UT1 --> UT2
+        UT2 -->|"exists AND not revoked AND not expired"| UT3
+        UT2 -->|"any check fails"| UT4
+    end
 
-3. Token Expiry:
-   ├─ Configured per environment
-   ├─ Default: 3600 seconds (1 hour)
-   ├─ Adjustable per token
-   └─ Automatic cleanup (optional job)
+    subgraph Expiry["3 — Token Expiry"]
+        E1["Default: 3600s (1hr) · Adjustable per token · Validated via datetime.utcnow() check"]
+    end
 ```
 
 ### Origin Protection
 
-```
-CDN Configuration:
-├─ Origin Shield enabled
-├─ IP whitelist
-│  ├─ Only CDN IPs can access origin
-│  └─ Blocks direct attacks
-│
-├─ Rate limiting
-│  ├─ Per-IP limits
-│  ├─ Protects upload endpoint
-│  └─ Prevents DOS
-│
-└─ HTTPS/TLS
-   ├─ Origin ↔ CDN: TLS
-   ├─ Client ↔ CDN: TLS
-   └─ Encryption in transit
+```mermaid
+graph TD
+    CDN["CDN Configuration"]
+    CDN --> OS["Origin Shield — only CDN IPs reach origin — blocks direct attacks"]
+    CDN --> RL["Rate Limiting — per-IP limits — protects upload endpoint — prevents DoS"]
+    CDN --> TLS["HTTPS / TLS — Origin to CDN: TLS — Client to CDN: TLS — encryption in transit"]
 ```
 
 ## Scalability Considerations
 
 ### Horizontal Scaling
 
-```
-Multiple Origin Servers (Behind Load Balancer)
-┌──────────────────────────────────────────┐
-│         Load Balancer (HAProxy)          │
-│  - Session persistence (optional)        │
-│  - Health checks                         │
-│  - Request distribution                  │
-└─┬────────────────────────────────────────┘
-  │
-  ├─► Origin Server 1 (FastAPI)
-  ├─► Origin Server 2 (FastAPI)
-  ├─► Origin Server 3 (FastAPI)
-  │
-  ├─ Shared PostgreSQL (read replicas)
-  │
-  └─ Shared Object Storage (MinIO/S3)
+```mermaid
+graph TB
+    LB["Load Balancer (HAProxy) — health checks · session persistence · request distribution"]
+    API1["Origin Server 1 (FastAPI)"]
+    API2["Origin Server 2 (FastAPI)"]
+    API3["Origin Server 3 (FastAPI)"]
+    DB[("PostgreSQL + Read Replicas")]
+    S3[("Shared Object Storage — MinIO / S3")]
+
+    LB --> API1
+    LB --> API2
+    LB --> API3
+    API1 & API2 & API3 --> DB
+    API1 & API2 & API3 --> S3
 ```
 
 ### Database Optimization
 
-```
-PostgreSQL:
-├─ Indexes on frequently queried columns
-│  ├─ Asset.id (primary key)
-│  ├─ AccessToken.token
-│  └─ AssetVersion.asset_id
-│
-├─ Partitioning (optional for scale)
-│  ├─ Partition AccessToken by month
-│  └─ Archive old versions
-│
-└─ Connection pooling
-   ├─ SQLAlchemy pool_size=20
-   └─ max_overflow=40
+```mermaid
+graph TD
+    PG["PostgreSQL Optimizations"]
+    PG --> IDX["Indexes — Asset.id (PK) · AccessToken.token · AssetVersion.asset_id"]
+    PG --> PART["Partitioning (optional) — AccessToken by month · archive old versions"]
+    PG --> POOL["Connection Pooling — SQLAlchemy pool_size=20 · max_overflow=40"]
 ```
 
 ## Performance Optimizations
@@ -399,61 +316,32 @@ PostgreSQL:
 
 ### Metrics to Track
 
-```
-Performance Metrics:
-├─ Response time (p50, p95, p99)
-├─ Cache hit ratio (>95% target)
-├─ Error rates (4xx, 5xx)
-├─ Request throughput (req/sec)
-└─ Bandwidth saved by caching
+**Performance Metrics:**
+- Response time (p50, p95, p99)
+- Cache hit ratio (>95% target)
+- Error rates (4xx, 5xx)
+- Request throughput (req/sec)
+- Bandwidth saved by caching
 
-Business Metrics:
-├─ Assets uploaded (count)
-├─ Total storage used (GB)
-├─ Private vs public asset split
-└─ Token generation rate
-```
+**Business Metrics:**
+- Assets uploaded (count)
+- Total storage used (GB)
+- Private vs public asset split
+- Token generation rate
 
 ### Logging
 
-```
-Structure:
-├─ Request logging
-│  ├─ Timestamp
-│  ├─ Method, Path, Status
-│  ├─ Response time
-│  ├─ Cache status
-│  └─ User agent
-│
-└─ Application logging
-   ├─ Upload operations
-   ├─ Token creation/validation
-   ├─ CDN purge operations
-   └─ Errors and exceptions
-```
+**Request Logging:** Timestamp · Method · Path · Status · Response time · Cache status · User agent
+
+**Application Logging:** Upload operations · Token creation/validation · CDN purge operations · Errors and exceptions
 
 ## Disaster Recovery
 
 ### Backup Strategy
 
-```
-1. Database Backups
-   ├─ Frequency: Daily
-   ├─ Retention: 30 days
-   ├─ Location: S3 backup bucket
-   └─ Restore time: <5 minutes
-
-2. Asset Backups
-   ├─ Frequency: Continuous (S3 versioning)
-   ├─ Retention: Per bucket policy
-   ├─ Location: Multi-region (optional)
-   └─ Restore time: <1 minute
-
-3. Configuration Backups
-   ├─ Frequency: On change
-   ├─ Location: Git repo
-   └─ Version control enabled
-```
+1. **Database Backups** — Daily · 30-day retention · S3 backup bucket · Restore time: <5 minutes
+2. **Asset Backups** — Continuous via S3 versioning · Per-bucket retention policy · Multi-region optional · Restore time: <1 minute
+3. **Configuration Backups** — On change · Stored in Git · Version controlled
 
 ## Summary
 
