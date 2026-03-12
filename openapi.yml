@@ -55,7 +55,7 @@ paths:
                   format: binary
                   description: The file to upload
       responses:
-        '200':
+        '201':
           description: Asset uploaded successfully
           content:
             application/json:
