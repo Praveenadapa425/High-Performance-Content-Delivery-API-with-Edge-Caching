@@ -1,13 +1,10 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
-from app.database import engine, Base
+from app.database import Base
 from app.models.asset import Asset, AssetVersion, AccessToken
 from app.routes.assets import router as assets_router
 from app.config import HOST, PORT, DEBUG
-
-# Create tables
-Base.metadata.create_all(bind=engine)
 
 app = FastAPI(
     title="High-Performance Content Delivery API",
@@ -26,6 +23,12 @@ app.add_middleware(
 
 # Include routes
 app.include_router(assets_router)
+
+
+def initialize_database():
+    """Initialize database tables. Call this only for production."""
+    from app.database import engine
+    Base.metadata.create_all(bind=engine)
 
 
 @app.get("/health")

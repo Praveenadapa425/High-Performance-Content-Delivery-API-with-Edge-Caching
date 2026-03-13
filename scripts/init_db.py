@@ -5,14 +5,13 @@ Creates all necessary tables and initializes the database.
 """
 
 import sys
-from app.database import engine, Base
-from app.models.asset import Asset, AssetVersion, AccessToken
+from app.main import initialize_database
 
 def init_db():
     """Initialize the database by creating all tables."""
     print("Initializing database...")
     try:
-        Base.metadata.create_all(bind=engine)
+        initialize_database()
         print("✓ Database initialized successfully")
         print("✓ Created tables: assets, asset_versions, access_tokens")
         return True
